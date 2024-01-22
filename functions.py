@@ -34,7 +34,29 @@ class eegData(Dataset):
         time = np.random.randint(0,len(out[0]))
         offset, *target = [o[time] for o in out]
         return int(offset),torch.tensor(target,dtype=torch.float32)
+
+class eegDataXonly(Dataset):
+    # random start time rather than centering around target
+    def __init__(self, df, dataPath, dataFolder, seqLen=10000):
+        # dataFolder save local vs global normalized eeg input
+        self.df = df
+        self.seqLen = seqLen
+        self._load_eegs(dataPath,dataFolder)
+        
+    def _load_eegs(self,dataPath,dataFolder):
+        self.eegs = [np.load(dataPath+dataFolder+'/'+str(id)+'.npy')\
+                      for id in self.df.eeg_id.tolist()]
+        self.eegs_len = [x.shape[0] for x in self.eegs]
+        
+    def __len__(self):
+        return self.df.shape[0]
     
+    def __getitem__(self,idx):
+        start = np.random.randint(0,max(self.eegs_len[idx]-self.seqLen-1,1))
+        eeg = self.eegs[idx][start:start+self.seqLen]
+        return torch.tensor(eeg,dtype=torch.float32)
+    
+
 
 """ Model """
 class Config(object):
@@ -101,7 +123,7 @@ class seq2seqModel(nn.Module):
         )
         
         self.norm_f = (nn.LayerNorm if not rms_norm else RMSNorm)(d_model)
-        self.autoLoss = nn.HuberLoss()
+        self.autoLoss = nn.L1Loss()
         self.classLoss = nn.KLDivLoss(reduction="batchmean")
         self.readOut = lambda x: x[:,-1]
         self.apply(
@@ -115,7 +137,7 @@ class seq2seqModel(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, target=None, inference_params=None):
+    def forward(self, input_ids, target=None, IsTrain=True, inference_params=None):
         # input_ids has shape b,l,d
         # if target is None, in predict mode, return logit
         # else return autoregressive loss, target_loss
@@ -143,12 +165,15 @@ class seq2seqModel(nn.Module):
             residual_in_fp32=self.config.residual_in_fp32,
         )
         
-        if target is None:
+        if IsTrain:
+            if target is None:
+                input_predict = self.model2input(hidden_states) # b,l,d
+                autoL = self.autoLoss(input_predict[:,:-1],input_ids[:,1:])
+                return autoL
+            else:
+                classlog = F.log_softmax(self.classHead(self.readOut(hidden_states)),-1) # b, k
+                classL = self.classLoss(classlog, target)
+                return classL
+        else:            
             classlog = F.softmax(self.classHead(self.readOut(hidden_states)),-1) # b, k
             return classlog
-        else:
-            input_predict = self.model2input(hidden_states) # b,l,d
-            classlog = F.log_softmax(self.classHead(self.readOut(hidden_states)),-1) # b, k
-            autoL = self.autoLoss(input_predict[:,:-1],input_ids[:,1:])
-            classL = self.classLoss(classlog, target)
-            return autoL,classL
